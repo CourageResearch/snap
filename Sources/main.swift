@@ -101,20 +101,110 @@ class WindowManager {
     func getCurrentScreen() -> NSScreen {
         if let window = getFrontmostWindow() {
             var positionRef: CFTypeRef?
+            var sizeRef: CFTypeRef?
             AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef)
+            AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef)
 
-            if let positionRef = positionRef {
+            if let positionRef = positionRef, let sizeRef = sizeRef {
                 var position = CGPoint.zero
+                var size = CGSize.zero
                 AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
+                AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
 
+                // Use the center of the window for better detection
+                let windowCenter = CGPoint(x: position.x + size.width / 2, y: position.y + size.height / 2)
+
+                // Find which screen contains the window center
                 for screen in NSScreen.screens {
-                    if screen.frame.contains(position) {
+                    // Convert screen frame to the same coordinate system as AX (origin at top-left of main screen)
+                    let mainScreen = NSScreen.screens[0]
+                    let screenTop = mainScreen.frame.height - screen.frame.origin.y - screen.frame.height
+                    let screenRect = CGRect(x: screen.frame.origin.x, y: screenTop, width: screen.frame.width, height: screen.frame.height)
+
+                    if screenRect.contains(windowCenter) {
+                        return screen
+                    }
+                }
+
+                // Fallback: find screen by X position overlap
+                for screen in NSScreen.screens {
+                    if position.x >= screen.frame.origin.x && position.x < screen.frame.origin.x + screen.frame.width {
                         return screen
                     }
                 }
             }
         }
         return NSScreen.main ?? NSScreen.screens[0]
+    }
+
+    // MARK: - Diagnostics
+
+    func showDiagnostics() {
+        var info = "=== SNAP DIAGNOSTICS ===\n\n"
+
+        // Screen info
+        info += "SCREENS (\(NSScreen.screens.count) total):\n"
+        let mainScreen = NSScreen.screens[0]
+        info += "Main screen height: \(mainScreen.frame.height)\n\n"
+
+        for (i, screen) in NSScreen.screens.enumerated() {
+            info += "Screen \(i): \(screen.localizedName)\n"
+            info += "  frame: x=\(screen.frame.origin.x), y=\(screen.frame.origin.y), w=\(screen.frame.width), h=\(screen.frame.height)\n"
+            info += "  visibleFrame: x=\(screen.visibleFrame.origin.x), y=\(screen.visibleFrame.origin.y), w=\(screen.visibleFrame.width), h=\(screen.visibleFrame.height)\n"
+
+            // Convert to AX coordinates
+            let screenTop = mainScreen.frame.height - screen.frame.origin.y - screen.frame.height
+            info += "  AX coords: x=\(screen.frame.origin.x), y=\(screenTop), w=\(screen.frame.width), h=\(screen.frame.height)\n\n"
+        }
+
+        // Window info
+        if let window = getFrontmostWindow() {
+            var positionRef: CFTypeRef?
+            var sizeRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef)
+            AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef)
+
+            if let positionRef = positionRef, let sizeRef = sizeRef {
+                var position = CGPoint.zero
+                var size = CGSize.zero
+                AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
+                AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+
+                info += "FRONTMOST WINDOW:\n"
+                info += "  AX position: x=\(position.x), y=\(position.y)\n"
+                info += "  AX size: w=\(size.width), h=\(size.height)\n"
+
+                let windowCenter = CGPoint(x: position.x + size.width / 2, y: position.y + size.height / 2)
+                info += "  Window center: x=\(windowCenter.x), y=\(windowCenter.y)\n\n"
+
+                // Check which screen contains it
+                info += "SCREEN DETECTION:\n"
+                for (i, screen) in NSScreen.screens.enumerated() {
+                    let screenTop = mainScreen.frame.height - screen.frame.origin.y - screen.frame.height
+                    let screenRect = CGRect(x: screen.frame.origin.x, y: screenTop, width: screen.frame.width, height: screen.frame.height)
+                    let contains = screenRect.contains(windowCenter)
+                    info += "  Screen \(i) AX rect: x=\(screenRect.origin.x), y=\(screenRect.origin.y), w=\(screenRect.width), h=\(screenRect.height) -> contains center: \(contains)\n"
+                }
+
+                let detected = getCurrentScreen()
+                info += "\n  Detected screen: \(detected.localizedName)\n"
+            }
+        } else {
+            info += "NO FRONTMOST WINDOW FOUND\n"
+        }
+
+        // Show alert with info
+        let alert = NSAlert()
+        alert.messageText = "Snap Diagnostics"
+        alert.informativeText = info
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Copy to Clipboard")
+        alert.addButton(withTitle: "OK")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(info, forType: .string)
+        }
     }
 
     // MARK: - Multi-Monitor Support
@@ -128,11 +218,19 @@ class WindowManager {
         // Sort screens by x position for left/right navigation
         let sortedScreens = screens.sorted { $0.frame.origin.x < $1.frame.origin.x }
 
-        guard let currentIndex = sortedScreens.firstIndex(of: currentScreen) else {
-            return nil
+        // Find current screen by comparing frames (more reliable than direct comparison)
+        var currentIndex: Int? = nil
+        for (index, screen) in sortedScreens.enumerated() {
+            if screen.frame.origin.x == currentScreen.frame.origin.x &&
+               screen.frame.origin.y == currentScreen.frame.origin.y {
+                currentIndex = index
+                break
+            }
         }
 
-        let newIndex = currentIndex + direction
+        guard let idx = currentIndex else { return nil }
+
+        let newIndex = idx + direction
         if newIndex >= 0 && newIndex < sortedScreens.count {
             return sortedScreens[newIndex]
         }
@@ -142,13 +240,18 @@ class WindowManager {
 
     func getUsableFrame(for screen: NSScreen) -> CGRect {
         let visibleFrame = screen.visibleFrame
-        let screenFrame = screen.frame
+        let mainScreen = NSScreen.screens[0]
 
-        let menuBarHeight = screenFrame.height - visibleFrame.height - visibleFrame.origin.y + screenFrame.origin.y
+        // Convert from macOS coordinates (origin bottom-left) to AX coordinates (origin top-left of main screen)
+        // In macOS: y=0 is at bottom, y increases upward
+        // In AX: y=0 is at top of main screen, y increases downward
+
+        // The top of the visible frame in AX coordinates
+        let visibleTop = mainScreen.frame.height - (visibleFrame.origin.y + visibleFrame.height)
 
         return CGRect(
             x: visibleFrame.origin.x,
-            y: menuBarHeight,
+            y: visibleTop,
             width: visibleFrame.width,
             height: visibleFrame.height
         )
@@ -167,39 +270,70 @@ class WindowManager {
         }
 
         let screen = getUsableFrame()
-        let tolerance: CGFloat = 20
+        let tolerance: CGFloat = 50
 
         let isAtLeft = abs(windowFrame.origin.x - screen.origin.x) < tolerance
         let isAtRight = abs(windowFrame.origin.x + windowFrame.width - screen.origin.x - screen.width) < tolerance
         let isAtTop = abs(windowFrame.origin.y - screen.origin.y) < tolerance
-        let isAtBottom = abs(windowFrame.origin.y + windowFrame.height - screen.origin.y - screen.height) < tolerance
 
         let isHalfWidth = abs(windowFrame.width - screen.width / 2) < tolerance
         let isFullWidth = abs(windowFrame.width - screen.width) < tolerance
-        let isHalfHeight = abs(windowFrame.height - screen.height / 2) < tolerance
-        let isFullHeight = abs(windowFrame.height - screen.height) < tolerance
 
-        // Check quarters first
-        if isHalfWidth && isHalfHeight {
-            if isAtLeft && isAtTop { return .topLeft }
-            if isAtRight && isAtTop { return .topRight }
-            if isAtLeft && isAtBottom { return .bottomLeft }
-            if isAtRight && isAtBottom { return .bottomRight }
-        }
+        // For height, just check if window is at top - don't require exact height match
+        // This allows windows coming from smaller monitors to still be detected
 
-        // Check halves
-        if isHalfWidth && isFullHeight {
+        // Check if at left or right edge with approximately half width
+        if isHalfWidth {
+            if isAtLeft && isAtTop {
+                // Could be left half or top-left quarter - check height ratio
+                let heightRatio = windowFrame.height / screen.height
+                if heightRatio > 0.7 {
+                    return .left
+                } else if heightRatio > 0.3 && heightRatio <= 0.7 {
+                    return .topLeft
+                }
+            }
+            if isAtRight && isAtTop {
+                let heightRatio = windowFrame.height / screen.height
+                if heightRatio > 0.7 {
+                    return .right
+                } else if heightRatio > 0.3 && heightRatio <= 0.7 {
+                    return .topRight
+                }
+            }
+            // Check bottom positions
+            if isAtLeft {
+                let bottomEdge = windowFrame.origin.y + windowFrame.height
+                let screenBottom = screen.origin.y + screen.height
+                if abs(bottomEdge - screenBottom) < tolerance {
+                    return .bottomLeft
+                }
+            }
+            if isAtRight {
+                let bottomEdge = windowFrame.origin.y + windowFrame.height
+                let screenBottom = screen.origin.y + screen.height
+                if abs(bottomEdge - screenBottom) < tolerance {
+                    return .bottomRight
+                }
+            }
+            // Default: if at left/right edge with half width, treat as half
             if isAtLeft { return .left }
             if isAtRight { return .right }
         }
 
-        if isFullWidth && isHalfHeight {
-            if isAtTop { return .top }
-            if isAtBottom { return .bottom }
-        }
-
-        if isFullWidth && isFullHeight {
-            return .maximized
+        if isFullWidth {
+            let heightRatio = windowFrame.height / screen.height
+            if heightRatio > 0.9 {
+                return .maximized
+            } else if isAtTop {
+                return .top
+            } else {
+                let bottomEdge = windowFrame.origin.y + windowFrame.height
+                let screenBottom = screen.origin.y + screen.height
+                if abs(bottomEdge - screenBottom) < tolerance {
+                    return .bottom
+                }
+            }
         }
 
         return .none
@@ -236,25 +370,44 @@ class WindowManager {
 
     // MARK: - Windows-style Smart Snap
 
+    // Check if window is snapped to left side (any height, any width up to ~60% of screen)
+    func isSnappedLeft() -> Bool {
+        guard let window = getFrontmostWindow(),
+              let windowFrame = getWindowFrame(window) else { return false }
+        let screen = getUsableFrame()
+        let tolerance: CGFloat = 50
+        let isAtLeft = abs(windowFrame.origin.x - screen.origin.x) < tolerance
+        // Window should be roughly half width (between 40% and 60% of screen width)
+        let widthRatio = windowFrame.width / screen.width
+        let isRoughlyHalfWidth = widthRatio > 0.35 && widthRatio < 0.65
+        return isAtLeft && isRoughlyHalfWidth
+    }
+
+    // Check if window is snapped to right side (any height, any width up to ~60% of screen)
+    func isSnappedRight() -> Bool {
+        guard let window = getFrontmostWindow(),
+              let windowFrame = getWindowFrame(window) else { return false }
+        let screen = getUsableFrame()
+        let tolerance: CGFloat = 50
+        let isAtRight = abs(windowFrame.origin.x + windowFrame.width - screen.origin.x - screen.width) < tolerance
+        // Window should be roughly half width (between 40% and 60% of screen width)
+        let widthRatio = windowFrame.width / screen.width
+        let isRoughlyHalfWidth = widthRatio > 0.35 && widthRatio < 0.65
+        return isAtRight && isRoughlyHalfWidth
+    }
+
     func handleLeft() {
         guard let window = getFrontmostWindow() else { return }
         let frame = getUsableFrame()
-        let current = detectCurrentPosition()
 
-        switch current {
-        case .right:
-            snapToFrame(window, frame: leftHalf(frame))
-        case .topRight:
-            snapToFrame(window, frame: topLeft(frame))
-        case .bottomRight:
-            snapToFrame(window, frame: bottomLeft(frame))
-        case .left, .topLeft, .bottomLeft:
-            // Already on left side, move to previous monitor
+        if isSnappedLeft() {
+            // Already on left side - move to previous monitor's right half
             if let prevScreen = getNextScreen(direction: -1) {
                 let prevFrame = getUsableFrame(for: prevScreen)
                 snapToFrame(window, frame: rightHalf(prevFrame))
             }
-        default:
+        } else {
+            // Snap to left half of current screen (always full height)
             snapToFrame(window, frame: leftHalf(frame))
         }
     }
@@ -262,22 +415,15 @@ class WindowManager {
     func handleRight() {
         guard let window = getFrontmostWindow() else { return }
         let frame = getUsableFrame()
-        let current = detectCurrentPosition()
 
-        switch current {
-        case .left:
-            snapToFrame(window, frame: rightHalf(frame))
-        case .topLeft:
-            snapToFrame(window, frame: topRight(frame))
-        case .bottomLeft:
-            snapToFrame(window, frame: bottomRight(frame))
-        case .right, .topRight, .bottomRight:
-            // Already on right side, move to next monitor
+        if isSnappedRight() {
+            // Already on right side - move to next monitor's left half
             if let nextScreen = getNextScreen(direction: 1) {
                 let nextFrame = getUsableFrame(for: nextScreen)
                 snapToFrame(window, frame: leftHalf(nextFrame))
             }
-        default:
+        } else {
+            // Snap to right half of current screen (always full height)
             snapToFrame(window, frame: rightHalf(frame))
         }
     }
@@ -285,22 +431,15 @@ class WindowManager {
     func handleUp() {
         guard let window = getFrontmostWindow() else { return }
         let frame = getUsableFrame()
-        let current = detectCurrentPosition()
 
-        switch current {
-        case .left:
+        if isSnappedLeft() {
+            // Left half -> top-left quarter
             snapToFrame(window, frame: topLeft(frame))
-        case .right:
+        } else if isSnappedRight() {
+            // Right half -> top-right quarter
             snapToFrame(window, frame: topRight(frame))
-        case .bottomLeft:
-            snapToFrame(window, frame: leftHalf(frame))
-        case .bottomRight:
-            snapToFrame(window, frame: rightHalf(frame))
-        case .topLeft, .topRight:
-            snapToFrame(window, frame: frame)
-        case .maximized:
-            break
-        default:
+        } else {
+            // Maximize
             snapToFrame(window, frame: frame)
         }
     }
@@ -308,24 +447,15 @@ class WindowManager {
     func handleDown() {
         guard let window = getFrontmostWindow() else { return }
         let frame = getUsableFrame()
-        let current = detectCurrentPosition()
 
-        switch current {
-        case .left:
+        if isSnappedLeft() {
+            // Left half -> bottom-left quarter
             snapToFrame(window, frame: bottomLeft(frame))
-        case .right:
+        } else if isSnappedRight() {
+            // Right half -> bottom-right quarter
             snapToFrame(window, frame: bottomRight(frame))
-        case .topLeft:
-            snapToFrame(window, frame: leftHalf(frame))
-        case .topRight:
-            snapToFrame(window, frame: rightHalf(frame))
-        case .bottomLeft, .bottomRight:
-            break
-        case .maximized:
-            break
-        default:
-            break
         }
+        // Otherwise do nothing
     }
 
     // MARK: - Frame Calculations
@@ -542,6 +672,9 @@ class HotkeyManager {
                 case 8: // C - center
                     wm.snapCenter()
                     return nil
+                case 2: // D - diagnostics
+                    wm.showDiagnostics()
+                    return nil
                 default:
                     break
                 }
@@ -583,7 +716,7 @@ class PreferencesWindowController: NSWindowController {
         contentView.addSubview(titleLabel)
 
         // Version
-        let versionLabel = NSTextField(labelWithString: "Version 1.1.0")
+        let versionLabel = NSTextField(labelWithString: "Version 1.2.2")
         versionLabel.font = NSFont.systemFont(ofSize: 12)
         versionLabel.textColor = .secondaryLabelColor
         versionLabel.frame = NSRect(x: 20, y: 170, width: 360, height: 20)
@@ -597,23 +730,33 @@ class PreferencesWindowController: NSWindowController {
 
         // Launch at login checkbox
         let launchCheckbox = NSButton(checkboxWithTitle: "Launch at login", target: self, action: #selector(toggleLaunchAtLogin(_:)))
-        launchCheckbox.frame = NSRect(x: 20, y: 115, width: 360, height: 25)
+        launchCheckbox.frame = NSRect(x: 20, y: 120, width: 360, height: 25)
         launchCheckbox.state = Preferences.shared.launchAtLogin ? .on : .off
         contentView.addSubview(launchCheckbox)
+
+        // Accessibility permissions button
+        let accessibilityButton = NSButton(title: "Open Accessibility Permissions", target: self, action: #selector(openAccessibilitySettings))
+        accessibilityButton.bezelStyle = .rounded
+        accessibilityButton.frame = NSRect(x: 20, y: 85, width: 220, height: 25)
+        contentView.addSubview(accessibilityButton)
 
         // Keyboard shortcuts section
         let shortcutsLabel = NSTextField(labelWithString: "Keyboard Shortcuts")
         shortcutsLabel.font = NSFont.boldSystemFont(ofSize: 13)
-        shortcutsLabel.frame = NSRect(x: 20, y: 80, width: 360, height: 20)
+        shortcutsLabel.frame = NSRect(x: 20, y: 55, width: 360, height: 20)
         contentView.addSubview(shortcutsLabel)
 
         let shortcutsText = NSTextField(labelWithString: "⌃⌥ + Arrows: Snap windows\n⌃⌥⇧ + ←/→: Move between monitors\n⌃⌥⌘ + 1-5: Thirds")
         shortcutsText.font = NSFont.systemFont(ofSize: 11)
         shortcutsText.textColor = .secondaryLabelColor
-        shortcutsText.frame = NSRect(x: 20, y: 20, width: 360, height: 55)
+        shortcutsText.frame = NSRect(x: 20, y: 5, width: 360, height: 50)
         contentView.addSubview(shortcutsText)
 
         window.contentView = contentView
+    }
+
+    @objc private func openAccessibilitySettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSButton) {
@@ -691,9 +834,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var preferencesWindowController: PreferencesWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if !checkAccessibilityPermissions() {
-            showAccessibilityAlert()
-        }
+        // Just check permissions - macOS will show its own prompt
+        _ = checkAccessibilityPermissions()
 
         setupStatusBar()
         HotkeyManager.shared.start()
@@ -744,6 +886,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
 
+        let versionItem = NSMenuItem(title: "Snap v1.2.2", action: nil, keyEquivalent: "")
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
+        menu.addItem(NSMenuItem.separator())
+
         menu.addItem(NSMenuItem(title: "Snap Left (⌃⌥←)", action: #selector(snapLeft), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Snap Right (⌃⌥→)", action: #selector(snapRight), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Snap Up (⌃⌥↑)", action: #selector(snapUp), keyEquivalent: ""))
@@ -770,6 +917,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(NSMenuItem(title: "Preferences...", action: #selector(showPreferences), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "Diagnostics (⌃⌥D)", action: #selector(showDiagnostics), keyEquivalent: ""))
 
         menu.addItem(NSMenuItem.separator())
 
@@ -799,6 +947,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         preferencesWindowController?.showWindow(nil)
         preferencesWindowController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showDiagnostics() {
+        WindowManager.shared.showDiagnostics()
     }
 
     @objc func quit() {
